@@ -4,6 +4,7 @@
 import json
 import math
 import os
+import random
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -206,6 +207,201 @@ def trend_models(epochs, trophies, target_time):
     return center, power_rates, sat_rates
 
 
+def logit_probability(value):
+    p = min(0.9999, max(0.0001, float(value)))
+    return math.log(p / (1.0 - p))
+
+
+def logistic(value):
+    if value >= 0.0:
+        e = math.exp(-min(value, 700.0))
+        return 1.0 / (1.0 + e)
+    e = math.exp(max(value, -700.0))
+    return e / (1.0 + e)
+
+
+def pooled_cohort_rates(epochs, trophies):
+    """Pool interval cohort earn rates against the previous snapshot rate."""
+    player_counts = [int(row["players_tracked"]) for _, row in epochs]
+    earns = [[earners(row["rates"][i], player_counts[e])
+              for e, (_, row) in enumerate(epochs)] for i in range(len(trophies))]
+    tiers = [str(t.get("tier", "bronze")).lower() for t in trophies]
+    observations = []
+    totals_e = [0] * len(trophies)
+    totals_n = [0] * len(trophies)
+    refreshes = []
+    for j in range(1, len(epochs)):
+        old_n, new_n = player_counts[j - 1], player_counts[j]
+        delta_n = max(0, new_n - old_n)
+        if delta_n <= 0:
+            continue
+        stamp_gap = max(1.0 / 60.0, (epochs[j][0] - epochs[j - 1][0]) / 3600.0)
+        multiplier = new_n / max(1, old_n)
+        refreshes.append((epochs[j][0], multiplier, stamp_gap))
+        for i in range(len(trophies)):
+            delta_e = max(0, earns[i][j] - earns[i][j - 1])
+            prior_rate = earns[i][j - 1] / max(1, old_n)
+            p_hat = (delta_e + 0.5) / (delta_n + 1.0)
+            observations.append((i, tiers[i], logit_probability(prior_rate),
+                                logit_probability(p_hat), float(delta_n)))
+            totals_e[i] += delta_e
+            totals_n[i] += delta_n
+
+    if refreshes:
+        cadence = median([r[2] for r in refreshes])
+        base_mult = max(1.0, refreshes[-1][1])
+    else:
+        cadence, base_mult = 6.0, 1.35
+
+    # Weighted logit regression: y=logit(cohort earn probability),
+    # x=logit(the same trophy's pre-refresh current rate).
+    if observations:
+        sw = sum(o[4] for o in observations)
+        mx = sum(o[2] * o[4] for o in observations) / max(1.0, sw)
+        my = sum(o[3] * o[4] for o in observations) / max(1.0, sw)
+        var = sum(o[4] * (o[2] - mx) ** 2 for o in observations)
+        cov = sum(o[4] * (o[2] - mx) * (o[3] - my) for o in observations)
+        slope = min(2.5, max(0.0, cov / var if var > 1e-10 else 1.0))
+        intercept = my - slope * mx
+    else:
+        slope, intercept = 1.0, 0.0
+
+    tier_residuals = {}
+    for _, tier, x, y, weight in observations:
+        tier_residuals.setdefault(tier, []).append((y - intercept - slope * x, weight))
+    tier_offsets = {}
+    for tier, values in tier_residuals.items():
+        weight = sum(w for _, w in values)
+        raw = sum(resid * w for resid, w in values) / max(1.0, weight)
+        tier_offsets[tier] = raw * weight / (weight + 800.0)
+
+    current_rates = [earns[i][-1] / max(1, player_counts[-1]) for i in range(len(trophies))]
+    pooled = []
+    for i, rate in enumerate(current_rates):
+        tier_offset = tier_offsets.get(tiers[i], 0.0)
+        p_pool = logistic(intercept + slope * logit_probability(rate) + tier_offset)
+        # A Beta prior equivalent to 80 entrants shrinks sparse trophy cohorts.
+        p_individual = (totals_e[i] + 80.0 * p_pool) / (totals_n[i] + 80.0)
+        pooled.append(min(0.9999, max(0.0001, p_individual)))
+
+    excesses = [max(1e-6, r[1] - 1.0) for r in refreshes]
+    decay_ratios = []
+    for i in range(1, len(refreshes)):
+        prev_excess, curr_excess = excesses[i - 1], excesses[i]
+        dt = max(1.0 / 60.0, (refreshes[i][0] - refreshes[i - 1][0]) / 3600.0)
+        decay_ratios.append((curr_excess / prev_excess) ** (cadence / dt))
+    decay = min(0.98, max(0.35, median(decay_ratios) if decay_ratios else 0.72))
+    return player_counts[-1], earns, pooled, cadence, base_mult, decay
+
+
+def poisson(rng, lam):
+    if lam <= 0:
+        return 0
+    limit = math.exp(-lam)
+    product = 1.0
+    count = 0
+    while product > limit:
+        count += 1
+        product *= rng.random()
+    return count - 1
+
+
+def binomial_draw(rng, n, p):
+    """Exact small-tail draws and a normal approximation for large cohorts."""
+    n = max(0, int(n))
+    p = min(1.0, max(0.0, p))
+    if n == 0 or p == 0.0:
+        return 0
+    if p == 1.0:
+        return n
+    mean = n * p
+    variance = mean * (1.0 - p)
+    if n <= 5000:
+        return rng.binomialvariate(n, p)
+    if mean < 30.0:
+        # Rare-event Poisson approximation to Binomial(n,p).
+        return min(n, poisson(rng, mean))
+    if n - mean < 30.0:
+        return n - min(n, poisson(rng, n - mean))
+    return min(n, max(0, int(math.floor(rng.gauss(mean, math.sqrt(variance)) + 0.5))))
+
+
+def quantile(sorted_values, p):
+    position = (len(sorted_values) - 1) * p
+    lo = int(position)
+    hi = min(len(sorted_values) - 1, lo + 1)
+    return sorted_values[lo] * (hi - position) + sorted_values[hi] * (position - lo)
+
+
+def cohort_forecast(epochs, trophies, target_time):
+    base_n, earn_matrix, probabilities, cadence, base_mult, decay = pooled_cohort_rates(epochs, trophies)
+    base_e = [values[-1] for values in earn_matrix]
+    horizon_hours = max(0.0, (target_time - epochs[-1][0]) / 3600.0)
+    days = horizon_hours / 24.0
+    drift_sd = 0.12 * math.sqrt(max(0.0, days))
+    expected_refreshes = horizon_hours / max(cadence, 1.0 / 60.0)
+    rng = random.Random(270414)
+    samples = [[] for _ in trophies]
+    latest_rates = epochs[-1][1]["rates"]
+    for _ in range(1000):
+        refresh_count = poisson(rng, expected_refreshes)
+        total_n = base_n
+        total_new = 0
+        for step in range(refresh_count):
+            excess = max(0.0, base_mult - 1.0) * (decay ** step)
+            excess *= math.exp(rng.gauss(0.0, 0.10))
+            new_n = max(0, int(math.floor(total_n * excess + 0.5)))
+            total_new += new_n
+            total_n += new_n
+
+        future_e = []
+        for i, p in enumerate(probabilities):
+            p_draw = logistic(logit_probability(p) + rng.gauss(0.0, 0.12))
+            future_e.append(base_e[i] + binomial_draw(rng, total_new, p_draw))
+        # Enforce non-decreasing earners and the story-chain order per draw.
+        future_e = [max(a, b) for a, b in zip(future_e, base_e)]
+        project_story(future_e, trophies)
+        rates = [min(99.99, max(0.0, 100.0 * e / max(1, total_n))) for e in future_e]
+        for i, trophy in enumerate(trophies):
+            if int(trophy["id"]) == 2 and (base_e[i] >= base_n or float(latest_rates[i]) >= 99.99):
+                rates[i] = 99.99
+            else:
+                rates[i] = min(99.99, max(0.0, 100.0 * logistic(
+                    logit_probability(rates[i] / 100.0) + rng.gauss(0.0, drift_sd))))
+        # Independent within-refresh drift can perturb the chain; re-project rates.
+        by_id = {int(t["id"]): i for i, t in enumerate(trophies)}
+        ids = [by_id[i] for i in STORY_IDS if i in by_id]
+        if len(ids) > 1:
+            ordered = pava([rates[i] for i in ids], increasing=False)
+            for i, value in zip(ids, ordered):
+                rates[i] = value
+        for i, rate in enumerate(rates):
+            samples[i].append(rate)
+
+    levels = []
+    for i, trophy in enumerate(trophies):
+        ordered = sorted(samples[i])
+        if int(trophy["id"]) == 2 and (base_e[i] >= base_n or float(latest_rates[i]) >= 99.99):
+            q = [99.99] * 5
+        else:
+            q = [quantile(ordered, p) for p in LEVELS]
+            if quantile(ordered, 0.5) < 0.02:
+                q = [0.01] * 5
+            else:
+                q = [0.01 if x < 0.02 else min(99.99, x) for x in q]
+        levels.append([round(x, 4) for x in q])
+    # PAVA again at each reported quantile to keep the story chain ordered.
+    by_id = {int(t["id"]): i for i, t in enumerate(trophies)}
+    ids = [by_id[i] for i in STORY_IDS if i in by_id]
+    if len(ids) > 1:
+        for col in range(5):
+            ordered = pava([levels[i][col] for i in ids], increasing=False)
+            for i, value in zip(ids, ordered):
+                levels[i][col] = round(min(99.99, max(0.01, value)), 4)
+    return {"trophies": [{"id": int(t["id"]), "q": levels[i]}
+                         for i, t in enumerate(trophies)]}
+
+
 def logit(rate):
     p = min(99.99, max(0.01, rate)) / 100.0
     return math.log(p / (1.0 - p))
@@ -226,6 +422,8 @@ def forecast(case):
     target_time = parse_time(case["target"])
     horizon_hours = max(0.0, (target_time - epochs[-1][0]) / 3600.0)
     launch_mode = len(epochs) == 1 and horizon_hours <= 6.0
+    if not launch_mode:
+        return cohort_forecast(epochs, case["trophies"], target_time)
     if launch_mode:
         center = launch_forecast(epochs, case["trophies"], horizon_hours)
         power_rates, sat_rates = center, center
