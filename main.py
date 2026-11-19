@@ -338,7 +338,26 @@ def cohort_forecast(epochs, trophies, target_time):
     base_e = [values[-1] for values in earn_matrix]
     horizon_hours = max(0.0, (target_time - epochs[-1][0]) / 3600.0)
     days = horizon_hours / 24.0
-    drift_sd = 0.12 * math.sqrt(max(0.0, days))
+    # Existing tracked players continue earning after each snapshot. Estimate
+    # their count trend from the last three distinct states, but heavily damp
+    # the launch-window slope before projecting it across a long horizon.
+    recent = epochs[-3:]
+    elapsed = [(stamp - recent[-1][0]) / 3600.0 for stamp, _ in recent]
+    progression = []
+    for i in range(len(trophies)):
+        ys = [math.log(max(1, earners(row["rates"][i], int(row["players_tracked"]))))
+              for _, row in recent]
+        slopes = [(ys[b] - ys[a]) / (elapsed[b] - elapsed[a])
+                  for a in range(len(ys)) for b in range(a + 1, len(ys))
+                  if elapsed[b] != elapsed[a]]
+        slope = median(slopes) if slopes else 0.0
+        # A launch trend cannot compound indefinitely; 0.006/hour is a
+        # conservative ceiling on the robust log-count slope.
+        slope = min(0.006, max(0.0, slope))
+        projected = int(math.floor(base_e[i] * math.exp(slope * horizon_hours * 0.60) + 0.5))
+        progression.append(max(base_e[i], min(base_n, projected)))
+
+    long_spread = min(3.0, max(0.35, 0.5 * math.sqrt(max(0.0, days))))
     expected_refreshes = horizon_hours / max(cadence, 1.0 / 60.0)
     rng = random.Random(270414)
     samples = [[] for _ in trophies]
@@ -357,7 +376,9 @@ def cohort_forecast(epochs, trophies, target_time):
         future_e = []
         for i, p in enumerate(probabilities):
             p_draw = logistic(logit_probability(p) + rng.gauss(0.0, 0.12))
-            future_e.append(base_e[i] + binomial_draw(rng, total_new, p_draw))
+            # Combine progression by existing players with earners from newly
+            # tracked cohorts, keeping E monotone and bounded by total players.
+            future_e.append(min(total_n, progression[i] + binomial_draw(rng, total_new, p_draw)))
         # Enforce non-decreasing earners and the story-chain order per draw.
         future_e = [max(a, b) for a, b in zip(future_e, base_e)]
         project_story(future_e, trophies)
@@ -366,8 +387,14 @@ def cohort_forecast(epochs, trophies, target_time):
             if int(trophy["id"]) == 2 and (base_e[i] >= base_n or float(latest_rates[i]) >= 99.99):
                 rates[i] = 99.99
             else:
+                # Model difference compares the damped existing-player path
+                # with the cohort-only path, in logit rate space.
+                base_path = 100.0 * progression[i] / max(1, total_n)
+                cohort_path = 100.0 * (base_e[i] + total_new * probabilities[i]) / max(1, total_n)
+                model_diff = min(0.08, 0.02 * abs(logit(base_path) - logit(cohort_path)))
+                spread = min(3.0, long_spread + model_diff)
                 rates[i] = min(99.99, max(0.0, 100.0 * logistic(
-                    logit_probability(rates[i] / 100.0) + rng.gauss(0.0, drift_sd))))
+                    logit_probability(rates[i] / 100.0) + rng.gauss(0.0, spread))))
         # Independent within-refresh drift can perturb the chain; re-project rates.
         by_id = {int(t["id"]): i for i, t in enumerate(trophies)}
         ids = [by_id[i] for i in STORY_IDS if i in by_id]
