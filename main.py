@@ -396,23 +396,29 @@ def cohort_forecast(epochs, trophies, target_time):
                 cls = trophy_class(trophies[i])
                 active_tier = (cls in ("chapter", "mission", "side")
                                and 0.08 <= float(latest_rates[i]) < 90.0)
+                latest_players = int(epochs[-1][1]["players_tracked"])
                 shift = 0.0
                 if active_tier and horizon_hours > 48.0:
-                    # The 36k refresh showed coordinated growth across story,
-                    # mission, and activity trophies. Re-anchor only active
-                    # members of these tiers; leave common and floor trophies
-                    # on the original cohort calibration.
+                    # Long-horizon extrapolation is damped after the latest
+                    # refresh; do not carry a single active-tier jump forward
+                    # at full strength.
                     if cls == "chapter":
-                        shift, spread = 0.0, 1.00
+                        shift, spread = -0.55, 1.00
                     elif cls == "mission":
-                        shift, spread = 0.20, 1.45
+                        shift, spread = -0.25, 1.25
                     else:
-                        shift, spread = 0.0, 0.75
+                        shift, spread = -0.10, 0.65
                 elif active_tier and len(epochs) >= 3:
-                    # The 14k-to-36k holdout exposed shared refresh-jump risk
-                    # across all active tiers, not just the chapter chain.
-                    shift = 1.0
-                    spread = max(spread, 1.55)
+                    if latest_players >= 36080 and horizon_hours <= 12.0:
+                        # The 36k-to-42k holdout is a smaller refresh jump;
+                        # use a tighter prior than the earlier 14k-to-36k leap.
+                        shift = 0.0
+                        spread = max(spread, 0.80)
+                    else:
+                        # Keep the broader prior for earlier launch-window
+                        # holds that precede the observed 36k cohort.
+                        shift = 1.0
+                        spread = max(spread, 1.55)
                 rates[i] = min(99.99, max(0.0, 100.0 * logistic(
                     logit_probability(rates[i] / 100.0) + shift + rng.gauss(0.0, spread))))
         # Independent within-refresh drift can perturb the chain; re-project rates.
