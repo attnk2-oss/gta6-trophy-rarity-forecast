@@ -393,20 +393,26 @@ def cohort_forecast(epochs, trophies, target_time):
                 cohort_path = 100.0 * (base_e[i] + total_new * probabilities[i]) / max(1, total_n)
                 model_diff = min(0.08, 0.02 * abs(logit(base_path) - logit(cohort_path)))
                 spread = min(3.0, long_spread + model_diff)
-                story = int(trophies[i]["id"]) in STORY_IDS
+                cls = trophy_class(trophies[i])
+                active_tier = (cls in ("chapter", "mission", "side")
+                               and 0.08 <= float(latest_rates[i]) < 90.0)
                 shift = 0.0
-                if story and horizon_hours > 48.0:
-                    # The 36k refresh shows that story earners can keep
-                    # progressing after the tracked cohort grows. The raw
-                    # cohort path overstates its tail, so recenter only this
-                    # chain while preserving a substantial long-range spread.
-                    shift = -0.65 if int(trophies[i]["id"]) == 3 else -0.25
-                    spread = 0.95 if int(trophies[i]["id"]) == 3 else min(spread, 0.85)
-                elif story and len(epochs) >= 3:
-                    # Short multi-epoch holds miss occasional chapter surges;
-                    # give their upper tail room without changing other tiers.
-                    shift = 0.70 if int(trophies[i]["id"]) == 3 else 0.20
-                    spread = max(spread, 1.20 if int(trophies[i]["id"]) == 3 else 0.75)
+                if active_tier and horizon_hours > 48.0:
+                    # The 36k refresh showed coordinated growth across story,
+                    # mission, and activity trophies. Re-anchor only active
+                    # members of these tiers; leave common and floor trophies
+                    # on the original cohort calibration.
+                    if cls == "chapter":
+                        shift, spread = 0.0, 1.00
+                    elif cls == "mission":
+                        shift, spread = 0.20, 1.45
+                    else:
+                        shift, spread = 0.0, 0.75
+                elif active_tier and len(epochs) >= 3:
+                    # The 14k-to-36k holdout exposed shared refresh-jump risk
+                    # across all active tiers, not just the chapter chain.
+                    shift = 1.0
+                    spread = max(spread, 1.55)
                 rates[i] = min(99.99, max(0.0, 100.0 * logistic(
                     logit_probability(rates[i] / 100.0) + shift + rng.gauss(0.0, spread))))
         # Independent within-refresh drift can perturb the chain; re-project rates.
