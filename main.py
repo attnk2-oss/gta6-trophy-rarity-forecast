@@ -393,8 +393,22 @@ def cohort_forecast(epochs, trophies, target_time):
                 cohort_path = 100.0 * (base_e[i] + total_new * probabilities[i]) / max(1, total_n)
                 model_diff = min(0.08, 0.02 * abs(logit(base_path) - logit(cohort_path)))
                 spread = min(3.0, long_spread + model_diff)
+                story = int(trophies[i]["id"]) in STORY_IDS
+                shift = 0.0
+                if story and horizon_hours > 48.0:
+                    # The 36k refresh shows that story earners can keep
+                    # progressing after the tracked cohort grows. The raw
+                    # cohort path overstates its tail, so recenter only this
+                    # chain while preserving a substantial long-range spread.
+                    shift = -0.65 if int(trophies[i]["id"]) == 3 else -0.25
+                    spread = 0.95 if int(trophies[i]["id"]) == 3 else min(spread, 0.85)
+                elif story and len(epochs) >= 3:
+                    # Short multi-epoch holds miss occasional chapter surges;
+                    # give their upper tail room without changing other tiers.
+                    shift = 0.70 if int(trophies[i]["id"]) == 3 else 0.20
+                    spread = max(spread, 1.20 if int(trophies[i]["id"]) == 3 else 0.75)
                 rates[i] = min(99.99, max(0.0, 100.0 * logistic(
-                    logit_probability(rates[i] / 100.0) + rng.gauss(0.0, spread))))
+                    logit_probability(rates[i] / 100.0) + shift + rng.gauss(0.0, spread))))
         # Independent within-refresh drift can perturb the chain; re-project rates.
         by_id = {int(t["id"]): i for i, t in enumerate(trophies)}
         ids = [by_id[i] for i in STORY_IDS if i in by_id]
